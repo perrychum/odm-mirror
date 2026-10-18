@@ -1,0 +1,29 @@
+name: mirror-odm-to-ghcr
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 登录 GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: 从 Docker Hub 拉取
+        run: docker pull opendronemap/odm:latest
+
+      - name: 打标签并推送到 GHCR
+        run: |
+          set -e
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          docker tag opendronemap/odm:latest ghcr.io/$OWNER/odm:latest
+          docker push ghcr.io/$OWNER/odm:latest
+          echo "已推送: ghcr.io/$OWNER/odm:latest"
