@@ -1,22 +1,24 @@
 name: mirror-odm
 
 # 用途：在 GitHub 海外 runner 上从 Docker Hub 拉 ODM 镜像，同时推到两个地方：
-#   ① ghcr.io/<owner>/odm:<tag>          —— 方案A：国内可直连（实测 401=通）
-#   ② harborpush.suanleme.cn/<user>/odm:<tag> —— 方案B：共绩内网仓库，节点 100% 能拉
-#
-# 为什么两个都推：
-#   ghcr.io 国内可直连但共绩节点能不能拉还没验证；harborpush 是共绩自家仓库，
-#   一定能拉。两个都推，哪条通就用哪条，不用来回改 workflow。
+#   ① ghcr.io/<owner>/odm:<tag>                —— 方案A：国内可直连（实测 401=通）
+#   ② harborpush.suanleme.cn/<user>/odm:<tag>  —— 方案B：共绩内网仓库，节点 100% 能拉
 #
 # 放在仓库的 .github/workflows/mirror.yml
 #
 # ⚠ 需要先在仓库 Settings → Secrets and variables → Actions 添加：
-#     HARBOR_USER = pervchum
+#     HARBOR_USER = perchryum
 #     HARBOR_PASS = <共绩镜像仓库密码>
-#   （密码在共绩控制台 → 镜像仓库 → 访问凭证 里可查看/重置）
+#   不配也能跑，会自动跳过方案B，只推 ghcr.io。
 #
-# 2026-10-25：新增 harborpush 推送（解决"共绩节点拉不到 Docker Hub"）
-#             新增大磁盘清理（ODM GPU 镜像解压后 >10GB，runner 默认空间不够）
+# 2026-10-25 修复记录：
+#   · `if:` 表达式里**不能用 secrets 上下文**（GitHub 只允许
+#     github/needs/vars/strategy/matrix/job/runner/env/steps/inputs）。
+#     原写法 `if: secrets.HARBOR_USER != ''` 报
+#     "Unrecognized named-value: 'secrets'"，workflow 直接解析失败。
+#     → 改为 job 级 env 注入 secret，step 里判断 env.HARBOR_USER。
+#   · 新增磁盘清理：ODM GPU 镜像解压后 >10GB，runner 默认只有 ~14GB。
+#   · 所有 `name:` 里的裸冒号已去掉（YAML 会把 "xxx:yyy" 误解析成键值对）。
 
 on:
   workflow_dispatch:
@@ -30,7 +32,7 @@ on:
 
 permissions:
   contents: read
-  packages: write      # 推 ghcr.io 需要
+  packages: write
 
 jobs:
   mirror:
@@ -39,11 +41,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # GPU 版优先（ODM 的 CUDA 稠密重建），CPU 版顺带
         tag: [gpu, latest]
+    # ★ 关键：secret 只能在赋值表达式里用，不能在 if 里直接用。
+    #   先注入到 env，后面 step 的 if 就能判断 env.HARBOR_USER 是否为空。
+    env:
+      HARBOR_USER: ${{ secrets.HARBOR_USER }}
+      HARBOR_PASS: ${{ secrets.HARBOR_PASS }}
     steps:
-      # ★ 关键：ODM GPU 镜像解压后 10GB+，runner 默认只有 ~14GB 可用，
-      #   不清理会 "no space left on device"。删掉用不到的大件腾 20GB+。
       - name: 释放磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -55,54 +59,57 @@ jobs:
         run: |
           echo "owner=${{ github.repository_owner }}"
           echo "tag=${{ matrix.tag }}"
+          if [ -n "$HARBOR_USER" ]; then
+            echo "harborpush 已配置，方案B 会执行"
+          else
+            echo "harborpush 未配置，方案B 跳过"
+          fi
 
-      # ---------------- 从 Docker Hub 拉 ----------------
-      - name: 拉取 opendronemap/odm:${{ matrix.tag }}
+      - name: 从 Docker Hub 拉取镜像
         run: |
           set -e
-          docker pull opendronemap/odm:${{ matrix.tag }}
-          docker image inspect opendronemap/odm:${{ matrix.tag }} \
-            --format '镜像大小={{.Size}} 字节'
+          TAG="${{ matrix.tag }}"
+          docker pull "opendronemap/odm:${TAG}"
+          docker image inspect "opendronemap/odm:${TAG}" --format 'size_bytes={{.Size}}'
           df -h / | tail -1
 
-      # ---------------- 方案A：推 ghcr.io ----------------
       - name: 登录 GHCR
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: 推送到 ghcr.io
+      - name: 推送到 ghcr
         run: |
           set -e
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          SRC=opendronemap/odm:${{ matrix.tag }}
-          DST=ghcr.io/$OWNER/odm:${{ matrix.tag }}
+          TAG="${{ matrix.tag }}"
+          SRC="opendronemap/odm:${TAG}"
+          DST="ghcr.io/${OWNER}/odm:${TAG}"
           docker tag "$SRC" "$DST"
           docker push "$DST"
-          echo "✅ 方案A 完成: $DST"
+          echo "OK-A  $DST"
 
-      # ---------------- 方案B：推 harborpush（共绩内网）----------------
       - name: 登录 harborpush
-        if: ${{ secrets.HARBOR_USER != '' }}
+        if: env.HARBOR_USER != ''
         run: |
-          echo "${{ secrets.HARBOR_PASS }}" | \
-            docker login harborpush.suanleme.cn \
-              -u "${{ secrets.HARBOR_USER }}" --password-stdin
+          echo "$HARBOR_PASS" | docker login harborpush.suanleme.cn -u "$HARBOR_USER" --password-stdin
 
       - name: 推送到 harborpush
-        if: ${{ secrets.HARBOR_USER != '' }}
+        if: env.HARBOR_USER != ''
         run: |
           set -e
-          SRC=opendronemap/odm:${{ matrix.tag }}
-          DST=harborpush.suanleme.cn/${{ secrets.HARBOR_USER }}/odm:${{ matrix.tag }}
+          TAG="${{ matrix.tag }}"
+          SRC="opendronemap/odm:${TAG}"
+          DST="harborpush.suanleme.cn/${HARBOR_USER}/odm:${TAG}"
           docker tag "$SRC" "$DST"
           docker push "$DST"
-          echo "✅ 方案B 完成: $DST"
+          echo "OK-B  $DST"
 
-      # ---------------- 汇总 ----------------
       - name: 汇总可用地址
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          TAG="${{ matrix.tag }}"
           echo "=============================================="
-          echo "tag = ${{ matrix.tag }}"
-          echo "  方案A(ghcr.io)    : ghcr.io/$OWNER/odm:${{ matrix.tag }}"
-          echo "  方案B(harborpush) : harborpush.suanleme.cn/<user>/odm:${{ matrix.tag }}"
+          echo "tag  ${TAG}"
+          echo "A-ghcr        ghcr.io/${OWNER}/odm:${TAG}"
+          echo "B-harborpush  harborpush.suanleme.cn/${HARBOR_USER}/odm:${TAG}"
           echo "=============================================="
