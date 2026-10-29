@@ -1,0 +1,255 @@
+name: build-euca-val-image
+
+# 用途：造一个「ubuntu 基础 ODM + execd」的验证镜像，推到 ghcr.io。
+#
+# 为什么走 GitHub Actions 而不是本机：
+#   · 本机在办公室内网（192.168.0.x），连 ghcr.io 是国际链路，实测只有 0.17 MB/s
+#     （文档里记的 1.1~2.0 MB/s 是早先测的，今天复现不了），搬 0.63GB 要 6 小时以上
+#   · GitHub 海外 runner 到 ghcr 是内网级，历史上推 5.7GB 只要 80 秒
+#   · 共绩节点**能直连拉 ghcr**（2026-10-30 实测：ghcr.io/perrychum/odm:latest
+#     在福建四区 232 秒起来、真计费），所以推完即可用，不必经共绩 Harbor
+#
+# 这个镜像只做**环境验证**：基底是 ghcr.io/perrychum/odm:latest
+# （ubuntu:24.04 + ODM 3.6.2，GIT_COMMIT d518d1f，与生产 gpu-v10 同源），
+# 只加一层 execd（单文件、零依赖）并把入口改成它，
+# 这样我们能进容器跑 import pdal / gdal / opendm —— 正是当年 v8~v11 反复打补丁的地方。
+#
+# 放置位置：perrychum/odm-mirror 仓库的 .github/workflows/build-euca-val.yml
+# 触发：仓库页 → Actions → build-euca-val-image → Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '输出 tag（默认 euca-val1）'
+        required: false
+        default: 'euca-val1'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 登录 GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: 拉基底镜像（ubuntu 版 ODM，已在 ghcr 上）
+        run: |
+          set -e
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "OWNER=$OWNER" >> "$GITHUB_ENV"
+          docker pull ghcr.io/$OWNER/odm:latest
+          docker image inspect ghcr.io/$OWNER/odm:latest \
+            --format 'base size={{.Size}} entrypoint={{.Config.Entrypoint}}'
+
+      - name: 写入 execd.py 并构建
+        run: |
+          set -e
+          mkdir -p /tmp/ctx/usr/local/bin/euca
+          cat > /tmp/ctx/usr/local/bin/euca/execd.py <<'EXECD_EOF'
+# -*- coding: utf-8 -*-
+"""v6 容器的远程执行代理（只用标准库，不依赖 fastapi/uvicorn）。
+
+为什么不用 Jupyter：官方 ODM 镜像里没有 JupyterLab，而我们共绩容器的
+控制通道一直是 Jupyter 内核通道。装 Jupyter 要几十个 wheel，体积大、启动慢。
+这个代理只有一个文件、零依赖，能力对齐我们在实测里真正用到的部分：
+
+    GET  /healthz              探活
+    POST /exec    {cmd,timeout}  同步执行，返回 rc/stdout/stderr
+    POST /execbg  {cmd,log,cwd}  后台跑（start_new_session，长任务不会被杀）
+    POST /alive   {pid}          进程是否还活着
+    POST /put     {path,b64}     写文件（base64）
+    GET  /get?path=...           读文件（返回 base64）
+    GET  /tail?path=...&n=200    看日志尾部
+
+注意：后台任务必须用 start_new_session=True（2026-10-26 踩坑：
+Jupyter subprocess 会杀掉子进程，rc=-15 且日志都没建）。
+"""
+import argparse
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+WORKDIR = "/root/work"
+TOKEN = os.environ.get("EUCA_TOKEN", "")
+
+
+def _run(cmd, timeout=120, cwd=None):
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, timeout=timeout,
+                           cwd=cwd or WORKDIR)
+        return {"code": p.returncode,
+                "out": p.stdout.decode("utf-8", "replace"),
+                "err": p.stderr.decode("utf-8", "replace")}
+    except subprocess.TimeoutExpired as e:
+        return {"code": -9,
+                "out": (e.stdout or b"").decode("utf-8", "replace"),
+                "err": "TIMEOUT after %ss" % timeout}
+    except Exception as e:                                     # noqa: BLE001
+        return {"code": -1, "out": "", "err": repr(e)}
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):        # 静音
+        pass
+
+    def _send(self, obj, code=200):
+        b = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _auth(self, q):
+        if not TOKEN:
+            return True
+        return (q.get("token", [""])[0] == TOKEN or
+                self.headers.get("X-Euca-Token", "") == TOKEN)
+
+    # ---------------- GET ----------------
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if not self._auth(q):
+            return self._send({"ok": False, "err": "unauthorized"}, 403)
+        if u.path.startswith("/healthz"):
+            return self._send({"ok": True, "pid": os.getpid(),
+                                "host": os.uname().nodename,
+                                "python": sys.version.split()[0]})
+        if u.path.startswith("/tail"):
+            path = q.get("path", ["/tmp/x.log"])[0]
+            n = int(q.get("n", ["200"])[0])
+            try:
+                with open(path, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - n * 400))
+                    data = f.read().decode("utf-8", "replace")
+            except Exception as e:                              # noqa: BLE001
+                return self._send({"ok": False, "err": repr(e)})
+            return self._send({"ok": True, "out": data})
+        if u.path.startswith("/get"):
+            path = q.get("path", [""])[0]
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except Exception as e:                              # noqa: BLE001
+                return self._send({"ok": False, "err": repr(e)})
+            return self._send({"ok": True, "size": len(data),
+                                "b64": base64.b64encode(data).decode()})
+        return self._send({"ok": False, "err": "not found"}, 404)
+
+    # ---------------- POST ----------------
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:                                       # noqa: BLE001
+            body = {}
+        if not self._auth(parse_qs(urlparse(self.path).query)):
+            return self._send({"ok": False, "err": "unauthorized"}, 403)
+        op = body.get("op") or "exec"
+        if op == "exec":
+            r = _run(body.get("cmd", ""), int(body.get("timeout", 120)), body.get("cwd"))
+            r["ok"] = True
+            return self._send(r)
+        if op == "execbg":
+            cmd = body.get("cmd", "")
+            logp = body.get("log") or ("/root/bg_%d.log" % int(time.time()))
+            try:
+                os.makedirs(os.path.dirname(logp), exist_ok=True)
+            except Exception:                                   # noqa: BLE001
+                pass
+            lf = open(logp, "wb")
+            p = subprocess.Popen(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True,
+                                 cwd=body.get("cwd") or WORKDIR)
+            lf.close()
+            return self._send({"ok": True, "pid": p.pid, "log": logp})
+        if op == "alive":
+            pid = int(body.get("pid") or 0)
+            alive = True
+            try:
+                os.kill(pid, 0)
+            except Exception:                                   # noqa: BLE001
+                alive = False
+            return self._send({"ok": True, "alive": alive})
+        if op == "kill":
+            pid = int(body.get("pid") or 0)
+            try:
+                os.kill(pid, 9)
+            except Exception as e:                              # noqa: BLE001
+                return self._send({"ok": False, "err": repr(e)})
+            return self._send({"ok": True})
+        if op == "put":
+            path = body.get("path") or ""
+            data = base64.b64decode(body.get("b64") or "")
+            # ★ Windows 写出的文件是 CRLF，bash 会报 "$'\r': command not found"
+            if path.endswith((".sh", ".bash")):
+                data = data.replace(b"\r\n", b"\n")
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(data)
+                os.chmod(path, 0o755)
+            except Exception as e:                              # noqa: BLE001
+                return self._send({"ok": False, "err": repr(e)})
+            return self._send({"ok": True, "size": len(data)})
+        return self._send({"ok": False, "err": "bad op"}, 400)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--host", default="0.0.0.0")
+    a = ap.parse_args()
+    os.makedirs(WORKDIR, exist_ok=True)
+    srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    srv.daemon_threads = True
+    print("[execd] listening on %s:%d  workdir=%s" % (a.host, a.port, WORKDIR), flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+
+EXECD_EOF
+          chmod +x /tmp/ctx/usr/local/bin/euca/execd.py
+          wc -l /tmp/ctx/usr/local/bin/euca/execd.py
+
+          cat > /tmp/ctx/Dockerfile <<'DOCKER_EOF'
+          FROM ghcr.io/OWNER_PLACEHOLDER/odm:latest
+          COPY usr/local/bin/euca/execd.py /usr/local/bin/euca/execd.py
+          RUN chmod 755 /usr/local/bin/euca/execd.py
+          WORKDIR /root
+          ENTRYPOINT ["python3", "/usr/local/bin/euca/execd.py", "--port", "8000"]
+          DOCKER_EOF
+          sed -i "s|OWNER_PLACEHOLDER|$OWNER|" /tmp/ctx/Dockerfile
+          cat /tmp/ctx/Dockerfile
+
+          docker build -t ghcr.io/$OWNER/odm:${{ github.event.inputs.tag || 'euca-val1' }} /tmp/ctx
+          docker image inspect ghcr.io/$OWNER/odm:${{ github.event.inputs.tag || 'euca-val1' }} \
+            --format 'final size={{.Size}} entrypoint={{.Config.Entrypoint}}'
+
+      - name: 推送
+        run: |
+          set -e
+          TAG=${{ github.event.inputs.tag || 'euca-val1' }}
+          DST=ghcr.io/$OWNER/odm:$TAG
+          docker push "$DST"
+          echo "========================================"
+          echo "已推送: $DST"
+          echo "共绩建机可直接用这个地址（已验证共绩能拉 ghcr）"
+          echo "========================================"
